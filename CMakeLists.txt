@@ -7,10 +7,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-# ─── generate_data  (pure C++) ─────────────────────────────────────────────
-add_executable(generate_data generate_data.cpp)
-target_compile_features(generate_data PRIVATE cxx_std_17)
-
 # ─── run_benchmark  (CUDA) ─────────────────────────────────────────────────
 add_executable(run_benchmark benchmark.cu)
 
@@ -25,4 +21,4 @@ set_target_properties(run_benchmark PROPERTIES
 )
 
 find_package(CUDAToolkit REQUIRED)
-target_link_libraries(run_benchmark CUDA::cudart)
+target_link_libraries(run_benchmark CUDA::cudart CUDA::cublas)
