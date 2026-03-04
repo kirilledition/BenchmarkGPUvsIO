@@ -39,3 +39,10 @@
 
 # debug information files
 *.dwo
+
+# CMake build directory
+build/
+
+# Generated benchmark data files
+*.bin
+
