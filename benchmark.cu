@@ -5,8 +5,8 @@
 //   Phase A: Raw disk read with O_DIRECT (bypasses OS page cache).
 //   Phase B: Host→Device transfer using pinned (page-locked) memory and
 //            cudaMemcpyAsync (stream 0).
-//   Phase C: GWAS dummy kernel — unpack 2-bit PLINK genotypes, compute
-//            y = X·β, apply threshold, write output (stream 1).
+//   Phase C: GRM kernel — unpack 2-bit PLINK genotypes to float matrix,
+//            compute GRM contribution via cuBLAS SGEMM (stream 1).
 //   Phase D: Two cudaStream_t streams are used to overlap compute with
 //            transfers; cudaStreamSynchronize guards ring-buffer reuse.
 //
@@ -16,6 +16,7 @@
 // chunk_mb defaults to 256 (256 MiB per chunk).
 
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 
 #include <algorithm>
 #include <chrono>
@@ -42,8 +43,10 @@ static constexpr int BYTES_PER_SNP   = N_SAMPLES / 4;  // 256
 // One CUDA thread per packed byte within a SNP block.
 static constexpr int THREADS_PER_SNP = BYTES_PER_SNP;  // 256
 
-// Association score threshold for the dummy statistical filter.
-static constexpr float THRESHOLD     = 0.5f;
+// Number of SNP rows per cuBLAS SGEMM tile.  Each tile is unpacked to a
+// float matrix of size [TILE_SNPS × N_SAMPLES] before the SGEMM call.
+// 65 536 SNPs × 1024 samples × 4 bytes = 256 MiB per tile buffer.
+static constexpr int TILE_SNPS       = 65536;
 
 // Default I/O chunk size (can be overridden on the command line).
 static constexpr size_t DEFAULT_CHUNK_MB = 256;
@@ -56,6 +59,16 @@ static constexpr size_t DEFAULT_CHUNK_MB = 256;
         if (_e != cudaSuccess) {                                                \
             fprintf(stderr, "CUDA error at %s:%d — %s\n",                      \
                     __FILE__, __LINE__, cudaGetErrorString(_e));                 \
+            exit(EXIT_FAILURE);                                                 \
+        }                                                                       \
+    } while (0)
+
+#define CUBLAS_CHECK(call)                                                      \
+    do {                                                                        \
+        cublasStatus_t _s = (call);                                             \
+        if (_s != CUBLAS_STATUS_SUCCESS) {                                      \
+            fprintf(stderr, "cuBLAS error at %s:%d — status %d\n",             \
+                    __FILE__, __LINE__, static_cast<int>(_s));                   \
             exit(EXIT_FAILURE);                                                 \
         }                                                                       \
     } while (0)
@@ -74,56 +87,34 @@ float plink_to_float(unsigned bits) {
     return (bits < 2u) ? 0.0f : static_cast<float>(bits - 1u);
 }
 
-// ─── GWAS dummy kernel (Phase C) ─────────────────────────────────────────────
+// ─── Genotype unpack kernel (Phase C, step 1) ────────────────────────────────
 //
-// Grid  : (n_snps, 1, 1)   — one block per SNP row
-// Block : (256, 1, 1)      — one thread per packed byte  (= 4 samples)
+// Grid  : (tile_snps, 1, 1)   — one block per SNP row in the current tile
+// Block : (256, 1, 1)         — one thread per packed byte  (= 4 samples)
 //
-// Per-thread steps:
-//   1. Read one packed byte → unpack 4 × 2-bit PLINK genotypes → 32-bit floats.
-//   2. Compute partial dot-product with the corresponding beta slice (y = X·β).
-// Block-level steps:
-//   3. Parallel-reduction tree to accumulate the full dot-product across all
-//      256 threads (all 1024 samples).
-//   4. Thread 0 applies a threshold and writes the association score.
+// Each thread reads one packed byte, extracts four 2-bit PLINK genotype
+// codes, converts them to float dosages, and writes them into the unpacked
+// float matrix X.  The unpacked matrix is then consumed by cuBLAS SGEMM to
+// compute the Genetic Relationship Matrix (GRM) contribution.
 
-__global__ void gwas_kernel(
-        const uint8_t* __restrict__ packed,   // [n_snps × BYTES_PER_SNP]
-        const float*   __restrict__ beta,     // [N_SAMPLES]
-        float*         __restrict__ output,   // [n_snps]
-        int n_snps)
+__global__ void unpack_kernel(
+        const uint8_t* __restrict__ packed,   // [tile_snps × BYTES_PER_SNP]
+        float*         __restrict__ X,        // [tile_snps × N_SAMPLES]
+        int tile_snps)
 {
-    const int snp = blockIdx.x;   // SNP index
-    const int tid = threadIdx.x;  // byte index within SNP (0…255)
+    const int snp = blockIdx.x;
+    const int tid = threadIdx.x;
 
-    if (snp >= n_snps) return;
+    if (snp >= tile_snps) return;
 
-    __shared__ float sdata[THREADS_PER_SNP];
-
-    // ── Step 1 & 2: unpack + partial dot-product ─────────────────────────
     const uint8_t byte = packed[(size_t)snp * BYTES_PER_SNP + tid];
-    const int     base = tid * 4;  // first sample index for this thread
+    const int     base = tid * 4;
+    const size_t  row  = (size_t)snp * N_SAMPLES;
 
-    const float g0 = plink_to_float( byte        & 0x3u);
-    const float g1 = plink_to_float((byte >> 2u) & 0x3u);
-    const float g2 = plink_to_float((byte >> 4u) & 0x3u);
-    const float g3 = plink_to_float((byte >> 6u) & 0x3u);
-
-    sdata[tid] = g0 * beta[base]     + g1 * beta[base + 1]
-               + g2 * beta[base + 2] + g3 * beta[base + 3];
-
-    __syncthreads();
-
-    // ── Step 3: parallel tree reduction ──────────────────────────────────
-    for (int s = THREADS_PER_SNP / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
-        __syncthreads();
-    }
-
-    // ── Step 4: threshold and write ───────────────────────────────────────
-    if (tid == 0) {
-        output[snp] = (sdata[0] > THRESHOLD) ? sdata[0] : 0.0f;
-    }
+    X[row + base + 0] = plink_to_float( byte        & 0x3u);
+    X[row + base + 1] = plink_to_float((byte >> 2u) & 0x3u);
+    X[row + base + 2] = plink_to_float((byte >> 4u) & 0x3u);
+    X[row + base + 3] = plink_to_float((byte >> 6u) & 0x3u);
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -219,23 +210,25 @@ int main(int argc, char* argv[])
 
     // Device buffers (double-buffered to match host ring).
     uint8_t* d_packed[2];
-    float*   d_output[2];
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < 2; ++i)
         CUDA_CHECK(cudaMalloc(&d_packed[i], chunk_bytes));
-        CUDA_CHECK(cudaMalloc(&d_output[i], n_snps * sizeof(float)));
-    }
 
-    // Beta vector: pre-generated effect-size estimates stored in VRAM.
-    float* d_beta;
-    CUDA_CHECK(cudaMalloc(&d_beta, N_SAMPLES * sizeof(float)));
-    {
-        std::vector<float> h_beta(N_SAMPLES);
-        for (int i = 0; i < N_SAMPLES; ++i)
-            h_beta[i] = 1e-3f * static_cast<float>(i % 100 + 1);
-        CUDA_CHECK(cudaMemcpy(d_beta, h_beta.data(),
-                              N_SAMPLES * sizeof(float),
-                              cudaMemcpyHostToDevice));
-    }
+    // Unpacked float matrix for one SGEMM tile: [TILE_SNPS × N_SAMPLES].
+    float* d_X;
+    CUDA_CHECK(cudaMalloc(&d_X,
+                          static_cast<size_t>(TILE_SNPS) * N_SAMPLES * sizeof(float)));
+
+    // Genetic Relationship Matrix (GRM): [N_SAMPLES × N_SAMPLES].
+    // Accumulated across all chunks via SGEMM: GRM += X_tile^T · X_tile.
+    float* d_grm;
+    CUDA_CHECK(cudaMalloc(&d_grm,
+                          static_cast<size_t>(N_SAMPLES) * N_SAMPLES * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_grm, 0,
+                          static_cast<size_t>(N_SAMPLES) * N_SAMPLES * sizeof(float)));
+
+    // cuBLAS handle for SGEMM calls.
+    cublasHandle_t cublas_handle;
+    CUBLAS_CHECK(cublasCreate(&cublas_handle));
 
     // ── Phase D: create two CUDA streams ─────────────────────────────────
     // stream[0]: Host → Device PCIe transfers
@@ -252,9 +245,8 @@ int main(int argc, char* argv[])
     CUDA_CHECK(cudaEventCreate(&ev_kern_start));
     CUDA_CHECK(cudaEventCreate(&ev_kern_stop));
 
-    // Kernel launch dimensions.
-    const dim3 grid(static_cast<unsigned>(n_snps));
-    const dim3 block(THREADS_PER_SNP);
+    // Set cuBLAS to use the compute stream.
+    CUBLAS_CHECK(cublasSetStream(cublas_handle, stream[1]));
 
     // Timing accumulators.
     double    t_disk   = 0.0;
@@ -307,12 +299,39 @@ int main(int argc, char* argv[])
         const int cur = static_cast<int>(k & 1);
         const int nxt = cur ^ 1;
 
-        // ── Phase C: launch kernel on current chunk ───────────────────
+        // ── Phase C: unpack + cuBLAS SGEMM (GRM) on current chunk ────
         CUDA_CHECK(cudaEventRecord(ev_kern_start, stream[1]));
-        gwas_kernel<<<grid, block, 0, stream[1]>>>(
-                d_packed[cur], d_beta, d_output[cur],
-                static_cast<int>(n_snps));
-        CUDA_CHECK(cudaGetLastError());
+        {
+            const float alpha = 1.0f;
+            for (size_t t = 0; t < n_snps; t += TILE_SNPS) {
+                const int tile = static_cast<int>(
+                        std::min(static_cast<size_t>(TILE_SNPS), n_snps - t));
+
+                // Step 1: unpack 2-bit genotypes → float matrix
+                unpack_kernel<<<tile, THREADS_PER_SNP, 0, stream[1]>>>(
+                        d_packed[cur] + t * BYTES_PER_SNP,
+                        d_X, tile);
+                CUDA_CHECK(cudaGetLastError());
+
+                // Step 2: GRM += X_tile^T · X_tile  (cuBLAS SGEMM)
+                //
+                // Row-major X_tile [tile × N_SAMPLES] is seen by cuBLAS
+                // (column-major) as X_tile^T [N_SAMPLES × tile].
+                //   A = X_tile^T  (N_SAMPLES × tile),  op(A) = N
+                //   B = X_tile^T  (N_SAMPLES × tile),  op(B) = T
+                //   C = GRM       (N_SAMPLES × N_SAMPLES)
+                //   C = α · A · B^T + β · C  =  α · X^T · X + β · GRM
+                const float beta_val = (k == 0 && t == 0) ? 0.0f : 1.0f;
+                CUBLAS_CHECK(cublasSgemm(cublas_handle,
+                        CUBLAS_OP_N, CUBLAS_OP_T,
+                        N_SAMPLES, N_SAMPLES, tile,
+                        &alpha,
+                        d_X, N_SAMPLES,
+                        d_X, N_SAMPLES,
+                        &beta_val,
+                        d_grm, N_SAMPLES));
+            }
+        }
         CUDA_CHECK(cudaEventRecord(ev_kern_stop, stream[1]));
 
         // ── Phase A + B: prepare next chunk while kernel runs ─────────
@@ -348,9 +367,11 @@ int main(int argc, char* argv[])
             t_kernel += static_cast<double>(ms) * 1e-3;
         }
 
-        // Each SNP costs 2 × N_SAMPLES FLOPs (fused multiply-add ×
-        // N_SAMPLES, plus the reduction tree which is O(N_SAMPLES)).
-        total_flops += static_cast<long long>(n_snps) * N_SAMPLES * 2;
+        // SGEMM FLOPs: 2 × m × n × k per tile, summed over all tiles.
+        // Total per chunk: 2 × N_SAMPLES × N_SAMPLES × n_snps.
+        total_flops += static_cast<long long>(n_snps)
+                     * static_cast<long long>(N_SAMPLES)
+                     * static_cast<long long>(N_SAMPLES) * 2;
 
         if (k % 10 == 0 || k + 1 == n_chunks) {
             const size_t computed = (k + 1) * chunk_bytes;
@@ -381,7 +402,7 @@ int main(int argc, char* argv[])
            "Pinned H→D Transfer  (Phase B):",
            (bytes_total / (double)(1ULL << 30)) / t_pcie);
     printf("║  %-34s  %8.3f TFLOPS ║\n",
-           "Kernel Execution  (Phase C):",
+           "GRM SGEMM  (Phase C):",
            static_cast<double>(total_flops) / (t_kernel * 1e12));
     printf("║  %-34s  %8.3f s      ║\n",
            "Total Pipeline  (wall clock):", t_total);
@@ -404,13 +425,14 @@ int main(int argc, char* argv[])
     CUDA_CHECK(cudaEventDestroy(ev_xfer_stop));
     CUDA_CHECK(cudaEventDestroy(ev_kern_start));
     CUDA_CHECK(cudaEventDestroy(ev_kern_stop));
+    CUBLAS_CHECK(cublasDestroy(cublas_handle));
     for (int i = 0; i < 2; ++i) {
         CUDA_CHECK(cudaStreamDestroy(stream[i]));
         CUDA_CHECK(cudaFreeHost(h_buf[i]));
         CUDA_CHECK(cudaFree(d_packed[i]));
-        CUDA_CHECK(cudaFree(d_output[i]));
     }
-    CUDA_CHECK(cudaFree(d_beta));
+    CUDA_CHECK(cudaFree(d_X));
+    CUDA_CHECK(cudaFree(d_grm));
     close(fd);
 
     return EXIT_SUCCESS;

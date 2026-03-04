@@ -7,7 +7,7 @@ each stage in a GWAS (Genome-Wide Association Study) data-processing loop:
 |-------|-----------------|
 | A | Raw NVMe disk read (`O_DIRECT`, no page-cache) |
 | B | Host → Device PCIe transfer (pinned memory + `cudaMemcpyAsync`) |
-| C | GWAS dummy kernel: 2-bit unpack → matrix-vector multiply → threshold |
+| C | GRM kernel: 2-bit unpack → cuBLAS SGEMM (Genetic Relationship Matrix) |
 | D | End-to-end wall-clock time of the asynchronous double-buffered pipeline |
 
 The pipeline uses **two CUDA streams** to overlap disk I/O, PCIe transfers,
@@ -21,7 +21,6 @@ I/O bound and GPUDirect Storage should be investigated.
 ```
 BenchmarkGPUvsIO/
 ├── benchmark.cu        ← Main CUDA benchmarking application
-├── generate_data.cpp   ← C++17 test-data generator (binary 2-bit genotypes)
 ├── CMakeLists.txt      ← CMake build (targets sm_89 / Ada Lovelace)
 ├── Dockerfile          ← Self-contained build environment
 └── README.md
@@ -33,6 +32,7 @@ BenchmarkGPUvsIO/
 
 * **Docker** — only external dependency for the containerised path
 * **NVIDIA driver** ≥ 525 (host)
+* **plink2** — for generating the synthetic BED dataset ([download](https://www.cog-genomics.org/plink/2.0/))
 * Enough free disk space on an NVMe volume for the test file (≥ 100 GiB)
 
 For a native (non-Docker) build you additionally need:
@@ -52,18 +52,20 @@ docker build -t benchmark_image .
 
 ### 2. Generate test data
 
-Write the 100 GiB dummy file to a directory on your **physical NVMe drive**
-(e.g. `/mnt/nvme/bench`).  Docker's internal overlay filesystem does not
-support `O_DIRECT`, so the file **must** live on a bind-mounted host path.
+Use the standard **plink2** binary to generate a synthetic BED dataset on your
+**physical NVMe drive** (e.g. `/mnt/nvme/bench`).  Docker's internal overlay
+filesystem does not support `O_DIRECT`, so the file **must** live on a
+bind-mounted host path.
 
 ```bash
-docker run --rm \
-  -v /mnt/nvme/bench:/data \
-  benchmark_image \
-  /app/build/generate_data /data/dummy_genotypes.bin 100
+# Install plink2 on the host (see https://www.cog-genomics.org/plink/2.0/)
+# Generate a synthetic dataset with 1024 samples and ~400M variants (~100 GiB BED)
+plink2 --dummy 1024 419430400 --make-bed --out /mnt/nvme/bench/synthetic
 ```
 
-The second numeric argument is the file size in GiB (default: 100).
+The `--dummy` flag produces random genotypes with a proper 3-byte BED header
+and variant-major orientation.  Adjust the variant count to control file size
+(each variant uses 256 bytes with 1024 samples).
 
 ### 3. Run the benchmark
 
@@ -74,7 +76,7 @@ docker run --rm \
   --shm-size=16g \
   --cap-add=SYS_NICE \
   benchmark_image \
-  /app/build/run_benchmark /data/dummy_genotypes.bin
+  /app/build/run_benchmark /data/synthetic.bed
 ```
 
 Flag reference:
@@ -89,7 +91,7 @@ Flag reference:
 An optional second argument overrides the chunk size (default: 256 MiB):
 
 ```bash
-/app/build/run_benchmark /data/dummy_genotypes.bin 512
+/app/build/run_benchmark /data/synthetic.bed 512
 ```
 
 ---
@@ -118,7 +120,7 @@ set_target_properties(run_benchmark PROPERTIES
 
 ```
 ────────────────────────────────────────────────────
-  File        : /data/dummy_genotypes.bin
+  File        : /data/synthetic.bed
   Size        : 100.00 GiB
   Chunk size  : 256 MiB
   Chunks      : 400
@@ -132,7 +134,7 @@ set_target_properties(run_benchmark PROPERTIES
 ╠══════════════════════════════════════════════════════════╣
 ║  Raw Disk Read  (Phase A):            4.210 GiB/s ║
 ║  Pinned H→D Transfer  (Phase B):     12.500 GiB/s ║
-║  Kernel Execution  (Phase C):        14.372 TFLOPS ║
+║  GRM SGEMM  (Phase C):              14.372 TFLOPS ║
 ║  Total Pipeline  (wall clock):       23.750 s      ║
 ╠══════════════════════════════════════════════════════════╣
 ║  T_disk  =   23.75 s                                   ║
